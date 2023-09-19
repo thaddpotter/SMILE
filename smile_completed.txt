@@ -1,31 +1,32 @@
 #%%
 import numpy as np
-import ctypes as ct
-import os
+from matplotlib import pyplot as plt
+from scipy.integrate import odeint, quad, dblquad
+from scipy import integrate
+from scipy.interpolate import interp1d
+import numba as nb
+from numba import njit
+from numba import cfunc
+from numba.types import intc, CPointer, float64
+from scipy import LowLevelCallable
+import time
 import sys
 
-import matplotlib
-matplotlib.use('TkAgg')
-
-import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
-from scipy.integrate import odeint
-
-
+#%%
 
 #This here is the big SMILE function.  This is the model itself
 def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, ti):
 
-    times= np.linspace(0*86400,14*86400,2048)
+    times= np.linspace(0*86400,14*86400,2000)
     t0 = 3.2 #Pulse Mid-Point
     mu = (m1* (1.988e30) * m2* (1.988e30)) / (m1* (1.988e30) + m2* (1.988e30))  # ratio
     G = 6.6743 * 10 ** (-11)  # Gravitational Constant
     c = 2.99792458e8  # speed of light
+    rs = 2 * G * (m1* (1.988e30) + m2* (1.988e30)) / (c ** 2)  # Total mass Schwarzschild Radius
     P = Periods * 86400  # orbital period in seconds
     a = ((P ** 2 * G * (m1* (1.988e30) + m2* (1.988e30))) / (4 * 3.14159265358 ** 2)) ** (1 / 3)  # system semi-major axis
     aph = a * (1 + ecc)  # aphelion
-    rs = 2 * G * (m1* (1.988e30) + m2* (1.988e30)) / (c ** 2)  # Total mass Schwarzschild
-    
+
     # initial conditions
     x1_0 = (m2* (1.988e30) * aph) / (m1* (1.988e30) + m2* (1.988e30))  # starting x position of mass 1
     x2_0 = -(m1* (1.988e30) * aph) / (m1* (1.988e30) + m2* (1.988e30))  # starting x position of mass 2
@@ -61,10 +62,7 @@ def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, 
     VY2_0 = vel2
 
     # Shift time coordinate by ti
-    from scipy.interpolate import interp1d
     t_shifted = np.linspace(-3*P, 3*P, 1000)-ti*86400
-
-
     S_0 = (X1_0, Y1_0, X2_0, Y2_0, VX1_0, VY1_0, VX2_0, VY2_0)
 
     ans = odeint(orbits, y0=S_0, t=t_shifted, args=(ti,))
@@ -106,7 +104,6 @@ def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, 
     vyp2 = f_vyp2(times)
 
     M = m1 * (1.988 * 10 ** 30)  # Mass of the Black Hole (kg)
-    m = m2 * (1.988 * 10 ** 30)  # Mass of the Companion Star (kg)
     ap = np.sqrt((xp2 - xp1) ** 2 + (yp2 - yp1) ** 2)
     ap0 = np.sqrt((xp20 - xp10) ** 2 + (yp20 - yp10) ** 2)
     vtran = np.sqrt(vxp1 ** 2 + vyp1 ** 2) + np.sqrt(vxp2 ** 2 + vyp2 ** 2)
@@ -119,38 +116,44 @@ def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, 
 
     u=((u0**2)+((((times/86400)-t0)/te))**2)**0.5  # Angular Separation
     
-    #for i in range(2048):
-    #    sys.stdout.write("U/V: " + str(u[i]/pstar[i]) + " U: ")
-    #    sys.stdout.write(str(u[i])+"\n")
-
     beta = 0.15 * (1+g) * ((15+gamma)/(3-gamma))
     
     sev = beta * ((m1/m2)*(rstar* (6.957e8)/(np.sqrt((xp2-xp1)**2+(yp2-yp1)**2)))**3*np.cos(2*((2*np.pi/P)*(times+ti*86400)+np.pi+omega))*np.sin((np.pi/2-phi* (np.pi / 180)))**2)
     delf = ((3-(alpha))*((((1/c)*(-1*(vxp2*np.sin(omega)*np.sin((np.pi/2-phi* (np.pi / 180)))+vyp2*np.cos(omega)*np.sin((np.pi/2-phi* (np.pi / 180))))))*np.sin((np.pi/2-phi* (np.pi / 180))))))
 
-    #Run the c version of the integral
-    #-------------------------------------------------------------------------
-    smilepath = os.getcwd()
-    lib = ct.CDLL(os.path.join(smilepath,'smile.so'))
+    variables=[pstar,u,times]
     
-    #Type conversion
-    pstar_c = (ct.c_double * 2048)()
-    u_c = (ct.c_double * 2048)()
-    curve = (ct.c_double * 2048)()
-    gamma_c = ct.c_float(gamma)
+    #This is where the very involved integration begins
+    def jit_integrand_function(integrand_function):
+        jitted_function = nb.jit(integrand_function, nopython=True)
 
-    #Fill arrays
-    for i in range(2048):
-        pstar_c[i]=pstar[i]
-        u_c[i] = u[i]
-        curve[i] = 0
+        #error_model="numpy" -> Don't check for division by zero
+        @cfunc(float64(intc, CPointer(float64)),error_model="numpy",fastmath=True)
+        def wrapped(n, xx):
+            ar = nb.carray(xx, n)
+            return jitted_function(ar[0], ar[1], ar[2], ar[3], ar[4])
+        return LowLevelCallable(wrapped.ctypes)
 
-    a = lib.big_integral(pstar_c, u_c, curve, gamma_c)
+    @jit_integrand_function
+    def pre_top(r, th, u, pstar, gamma):
+        eps2 = u*u + r*r - 2*u*r*np.cos(th)
+        return (1 - gamma * ((1-(1.5)*np.sqrt(1.-(r*r)/(pstar*pstar))))) * ((r * (eps2 + 2)) / (np.sqrt(eps2*(eps2 + 4))))
+
+    def function(variables,gamma):
+        [pstar,u,times]=variables
+        A = np.zeros(len(times))
+        for i, time in enumerate(times):
+            bottom = np.pi*pstar[i]*pstar[i]
+            top_res, top_err = integrate.dblquad(pre_top, 0, (2 * np.pi),0, pstar[i], args=(u[i], pstar[i], gamma))
+            A[i] = (top_res / bottom)
+        return A
     
-    return np.ctypeslib.as_array(curve)*(1+(delf+sev))
+    j = function(variables,gamma)*(1+(delf+sev))
+
+    return j
 
 
-
+#%%
 
 
 #These are our input parameters
@@ -168,15 +171,13 @@ ti = 12.5
 
 
 #Lastly, we plot the model over the data
-final=(Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, ti))
 
+start_t = time.perf_counter()
 
+for i in range(100):
+    final=(Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, ti))
 
+int_t = time.perf_counter()
+sys.stdout.write("Time to run 100 iterations: "+str(int_t-start_t)+"\n")
 
-timed=np.linspace(0*86400,14*86400,2048)
-plt.xlabel("Time (Days)",fontweight='bold',fontsize=14)
-plt.ylabel("Relative Flux",fontweight='bold',fontsize=14)
-plt.plot(timed/86400, final, "#FF6C0C")
-#plt.xlim(3.1,3.3)
-plt.show()
 # %%

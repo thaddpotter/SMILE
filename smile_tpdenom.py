@@ -9,9 +9,14 @@ from numba import njit
 from numba import cfunc
 from numba.types import intc, CPointer, float64
 from scipy import LowLevelCallable
+import time
+import sys
+
+#%%
 
 #This here is the big SMILE function.  This is the model itself
 def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, ti):
+
     times= np.linspace(0*86400,14*86400,2000)
     t0 = 3.2 #Pulse Mid-Point
     mu = (m1* (1.988e30) * m2* (1.988e30)) / (m1* (1.988e30) + m2* (1.988e30))  # ratio
@@ -98,8 +103,6 @@ def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, 
     f_vyp2 = interp1d(t_shifted, vyp2)
     vyp2 = f_vyp2(times)
 
-
-
     M = m1 * (1.988 * 10 ** 30)  # Mass of the Black Hole (kg)
     ap = np.sqrt((xp2 - xp1) ** 2 + (yp2 - yp1) ** 2)
     ap0 = np.sqrt((xp20 - xp10) ** 2 + (yp20 - yp10) ** 2)
@@ -119,10 +122,7 @@ def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, 
     delf = ((3-(alpha))*((((1/c)*(-1*(vxp2*np.sin(omega)*np.sin((np.pi/2-phi* (np.pi / 180)))+vyp2*np.cos(omega)*np.sin((np.pi/2-phi* (np.pi / 180))))))*np.sin((np.pi/2-phi* (np.pi / 180))))))
 
     variables=[pstar,u,times]
-
     
-    # take integral of top for all time values
-
     #This is where the very involved integration begins
     def jit_integrand_function(integrand_function):
         jitted_function = nb.jit(integrand_function, nopython=True)
@@ -136,20 +136,23 @@ def Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, 
 
     @jit_integrand_function
     def pre_top(r, th, u, pstar, gamma):
-        return (1 - gamma * ((1 - (3 / 2) * ((pstar ** 2 - r ** 2) / pstar ** 2) ** 0.5))) * ((r * (u ** 2 + r ** 2 - 2 * u * r * np.cos(th) + 2)) / ( (((u ** 2 + r ** 2 - 2 * u * r * np.cos(th))) ** 0.5) * (((u ** 2 + r ** 2 - 2 * u * r * np.cos(th) + 4)) ** 0.5)))
-    
+        eps2 = u*u + r*r - 2*u*r*np.cos(th)
+        return (1 - gamma * ((1-(1.5)*np.sqrt(1.-(r*r)/(pstar*pstar))))) * ((r * (eps2 + 2)) / (np.sqrt(eps2*(eps2 + 4))))
+
     def function(variables,gamma):
         [pstar,u,times]=variables
         A = np.zeros(len(times))
         for i, time in enumerate(times):
-            bottom = np.pi * pstar[i]**2
-            top_res, top_err = integrate.dblquad(pre_top, 0, (2 * np.pi), 0, pstar[i], args=(u[i], pstar[i], gamma))
-            A[i] = (top_res / bottom)
+            top_res, top_err = integrate.dblquad(pre_top, 0, (2 * np.pi),0, pstar[i], args=(u[i], pstar[i], gamma),epsabs=1e-6,epsrel=1e-4)
+            A[i] = top_res / (np.pi*pstar[i]*pstar[i])
         return A
-    return function(variables,gamma)*(1+(delf+sev))
+    
+    j = function(variables,gamma)*(1+(delf+sev))
+
+    return j
 
 
-
+#%%
 
 
 #These are our input parameters
@@ -167,11 +170,13 @@ ti = 12.5
 
 
 #Lastly, we plot the model over the data
-final=(Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, ti));
-timed=np.linspace(0*86400,14*86400,2000)
-plt.xlabel("Time (Days)",fontweight='bold',fontsize=14)
-plt.ylabel("Relative Flux",fontweight='bold',fontsize=14)
-plt.plot(timed/86400, final, "#FF6C0C")
-#plt.xlim(3.1,3.3)
-plt.show()
+
+start_t = time.perf_counter()
+
+for i in range(100):
+    final=(Light_curve_final(m1, m2, rstar, ecc, phi, omega, alpha, gamma, g, Periods, ti))
+
+int_t = time.perf_counter()
+sys.stdout.write("Time to run 100 iterations: "+str(int_t-start_t)+"\n")
+
 # %%
